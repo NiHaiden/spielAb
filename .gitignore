@@ -1,0 +1,4 @@
+/target/
+/.cargo-home/
+/.state/
+.airplay_sender_identity_*.json
