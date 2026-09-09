@@ -34,7 +34,7 @@ Required on the Linux host:
 - `ffmpeg` with the `libx264` encoder, and PipeWire's `pw-cat` utility. Hardware encoding additionally needs `h264_vaapi`, a VA-API driver with H.264 encoding support, and access to `/dev/dri/renderD*`.
 - Apple TV on the same reachable network with AirPlay enabled.
 
-The runner handles the missing libxkbcommon-x11 development symlink on this host using a local build directory. A normal `cargo build --locked` also works when all development libraries are installed.
+Plain `cargo run` and `cargo build --locked` work on this host. For native Linux GUI builds, `build.rs` supplies a build-local xkbcommon-x11 linker symlink when the compiler can find the runtime library but its development symlink is missing. No system files are changed. If neither library is installed, install the distribution’s xkbcommon-x11 development package. Cross-compilation requires the target development libraries.
 
 The development profile optimizes Spielab's packet handling and ChaCha20-Poly1305 dependencies because the development runner is used for live sharing. On this host the isolated 64 KiB video-packet encryption diagnostic fell from approximately 7.8 ms to 0.057 ms per packet. This microbenchmark does not measure display latency.
 
