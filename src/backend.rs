@@ -156,6 +156,7 @@ impl Worker {
                 self.emit(Event::Authenticated(name));
             }
             Command::ChooseScreen(mode) => {
+                anyhow::ensure!(self.authenticated, "Connect to Apple TV first");
                 self.emit(Event::Busy(
                     match mode {
                         CaptureMode::Mirror => "Single-click one screen or window, then press Share…",

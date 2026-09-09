@@ -10,13 +10,15 @@ The media mode is H.264 with selectable **720p/30**, **1080p/30** (default), or 
 ./scripts/run.sh
 ```
 
-Select your Apple TV, enter the code if prompted, choose a screen/window, then click **Start sharing**. **Disconnect / cancel** or Escape stops the session. The initial pairing is saved for subsequent connections.
+Use **Connection** to select your Apple TV and enter its code if prompted. Once authorization succeeds, Spielab opens **Sharing**, where you choose a screen/window or extended display, adjust stream quality, and click **Start sharing**. Sharing controls remain unavailable before authorization. The prominent **Disconnect** / **Cancel** button in the top-right corner, or Escape, stops the session. The initial pairing is saved for subsequent connections.
+
+**Settings → Appearance → Dark mode** switches between light and dark colors immediately. The preference is saved in `preferences.json` alongside the application's state and restored on the next launch. Settings remain accessible while connected or sharing.
 
 In the desktop picker, **single-click exactly one source, then press Share**. Avoid double-clicking: KDE portal 6.7.4 can abort when a source card accepts the dialog from its own click handler. Spielab requests checkbox selection to avoid that path; the workaround still needs interactive verification on this host.
 
 Choose quality before starting. The presets cap video bitrate at 8, 20, and 30 Mbps respectively. The 1080p presets preserve more detail; 60 fps needs more CPU and network capacity. Capture is scaled with the original aspect ratio preserved.
 
-GPU H.264 encoding is selected automatically through [FFmpeg's VA-API encoder](https://ffmpeg.org/ffmpeg-codecs.html#VAAPI-encoders) when available. Before sharing, Spielab tests actual encoded frames at the selected resolution and frame rate on accessible DRM render devices. If none pass, it uses software H.264. The streaming status shows **GPU H.264 · VA-API** or **Software H.264**. AMD Radeon 890M hardware encoding has been verified on this host; other VA-API drivers are selected only if their probe passes. NVENC and other hardware APIs are not implemented.
+GPU H.264 encoding is selected automatically through [FFmpeg's VA-API encoder](https://ffmpeg.org/ffmpeg-codecs.html#VAAPI-encoders) when available. Before sharing, Spielab tests actual encoded frames at the selected resolution and frame rate on accessible DRM render devices. If none pass, it uses software H.264. The command-line mirror example reports the selected encoder. AMD Radeon 890M hardware encoding has been verified on this host; other VA-API drivers are selected only if their probe passes. NVENC and other hardware APIs are not implemented.
 
 The GPU path uses VBR at a target of 75% of the selected bitrate cap, no B-frames, and an async depth of one. Software uses the existing CRF presets. Encoding runs on the GPU; desktop capture, scaling and transfer to GPU memory still involve the CPU. A device failure after the startup probe stops sharing with an error; it does not switch codecs or encoders in a running session.
 
