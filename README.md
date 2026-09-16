@@ -18,7 +18,7 @@ Targets modern Apple TVs with HomeKit pairing and PTP timing. HEVC, NVENC, and l
 
 - Linux with Wayland, Vulkan graphics drivers, PipeWire, and a working ScreenCast desktop portal.
 - Rust, a C linker, pkg-config, FreeType, Fontconfig, libxkbcommon, and libxkbcommon-x11.
-- GStreamer (`gst-launch-1.0`) with `pipewiresrc`, `queue`, `videoconvert`, `videoscale`, `videorate`, `y4menc`, and `fdsink`. `pipewiresrc` must support `keepalive-time`.
+- GStreamer 1.22+ (`gst-launch-1.0`) with `pipewiresrc`, `queue`, `videoconvertscale`, `videorate`, `y4menc`, and `fdsink`. `pipewiresrc` must support `keepalive-time`.
 - FFmpeg with `libx264`, plus PipeWire's `pw-cat`. GPU encoding also requires `h264_vaapi`, a compatible VA-API driver, and access to `/dev/dri/renderD*`.
 - Apple TV on the same network with AirPlay enabled.
 
@@ -46,7 +46,7 @@ cargo test --locked --no-default-features
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Additional ignored tests exercise real encoding and decoding. Run them with `cargo test --locked --no-default-features -- --ignored`; they require FFmpeg, and the hardware test requires VA-API H.264 on `/dev/dri/renderD128`.
+Additional ignored tests exercise real preprocessing, encoding and decoding, and provide packet timing diagnostics. Run them with `cargo test --locked --no-default-features -- --ignored`; they require GStreamer and FFmpeg, and the hardware test requires VA-API H.264 on `/dev/dri/renderD128`. Measurements and reproduction commands are in [Performance](docs/performance.md).
 
 CLI examples for discovery, pairing, and mirroring are in [`examples/`](examples/).
 

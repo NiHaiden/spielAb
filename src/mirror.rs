@@ -1,17 +1,14 @@
 //! AirPlay screen session (type 110 video and type 96 screen audio).
 //! Wire layout references: Doubletake's protocol implementation and UxPlay.
 use crate::{
-    media::{AudioCapture, VideoCapture},
+    media::{AudioCapture, VideoCapture, VideoFrame},
     pairing::ControlSession,
     settings::LatencyMode,
 };
 use airplay_crypto::chacha::ControlCipher;
 use airplay_rtsp::{RtspMethod, RtspRequest, RtspResponse};
 use anyhow::{Context, Result, ensure};
-use chacha20poly1305::{
-    ChaCha20Poly1305, KeyInit,
-    aead::{Aead, Payload},
-};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, aead::AeadInPlace};
 use hkdf::Hkdf;
 use plist::{Dictionary, Value};
 use rand::RngCore;
@@ -100,6 +97,7 @@ pub struct MirrorSession {
     video: TcpStream,
     video_cipher: ChaCha20Poly1305,
     video_nonce: u64,
+    video_packet: Vec<u8>,
     audio: UdpSocket,
     audio_control: UdpSocket,
     audio_cipher: ChaCha20Poly1305,
@@ -316,6 +314,7 @@ impl MirrorSession {
             video,
             video_cipher: ChaCha20Poly1305::new(&video_key.into()),
             video_nonce: 0,
+            video_packet: Vec::new(),
             audio,
             audio_control,
             audio_cipher: ChaCha20Poly1305::new(&audio_key.into()),
@@ -342,7 +341,7 @@ impl MirrorSession {
         progress: impl Fn(u64) + Send,
     ) -> Result<()> {
         enum Media {
-            Video(Instant, Vec<Vec<u8>>),
+            Video(Instant, VideoFrame),
             Audio(Instant, Vec<u8>),
             Error(anyhow::Error),
         }
@@ -350,7 +349,7 @@ impl MirrorSession {
         let video_send = send.clone();
         self.tasks.push(tokio::spawn(async move {
             loop {
-                let frame = match video.frame().await {
+                let frame = match video.frame_packet().await {
                     Ok(frame) => Media::Video(Instant::now(), frame),
                     Err(e) => Media::Error(e),
                 };
@@ -412,7 +411,7 @@ impl MirrorSession {
                     ensure!(self.audio_origin.is_some() || started.elapsed() < Duration::from_secs(15), "No system audio frames arrived from PipeWire");
                     if video_frames > 0 {
                         let mut packet = [0;128]; packet[4] = 2; packet[6] = 0x1e;
-                        self.write_video(&packet).await?;
+                        Self::write_video(&mut self.video, &packet).await?;
                     }
                     eprintln!("Stream sender: frames={} max_queue={}ms max_send={}ms lead={}ms",
                         video_frames - previous_frames, max_queue.as_millis(), max_send.as_millis(), self.latency.millis());
@@ -432,16 +431,16 @@ impl MirrorSession {
         }
     }
 
-    async fn write_video(&mut self, bytes: &[u8]) -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(2), self.video.write_all(bytes))
+    async fn write_video(video: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(2), video.write_all(bytes))
             .await
             .context("Apple TV stopped reading video")??;
         Ok(())
     }
 
-    async fn send_video(&mut self, time: Instant, nals: Vec<Vec<u8>>) -> Result<()> {
-        let sps = nals.iter().find(|n| n[0] & 31 == 7);
-        let pps = nals.iter().find(|n| n[0] & 31 == 8);
+    async fn send_video(&mut self, time: Instant, frame: VideoFrame) -> Result<()> {
+        let sps = frame.iter().find(|n| n[0] & 31 == 7);
+        let pps = frame.iter().find(|n| n[0] & 31 == 8);
         let clock = self.clock.lock().unwrap().clone();
         let timestamp = fixed_time(clock.at(time + self.latency.lead()));
         if let (Some(sps), Some(pps)) = (sps, pps) {
@@ -455,9 +454,10 @@ impl MirrorSession {
                     header[offset + 4..offset + 8]
                         .copy_from_slice(&(self.height as f32).to_le_bytes());
                 }
-                let mut packet = header.to_vec();
+                let mut packet = Vec::with_capacity(header.len() + config.len());
+                packet.extend_from_slice(&header);
                 packet.extend_from_slice(&config);
-                self.write_video(&packet).await?;
+                Self::write_video(&mut self.video, &packet).await?;
                 self.codec = Some(config);
             }
         }
@@ -465,29 +465,34 @@ impl MirrorSession {
             self.codec.is_some(),
             "Encoder did not provide H.264 SPS/PPS"
         );
-        let mut data = vec![];
+        // Keep one wire buffer across frames and encrypt its payload in place.
+        // NAL units borrow the capture packet, so each is copied just once.
+        let packet = &mut self.video_packet;
+        packet.clear();
+        packet.resize(128, 0);
         let mut keyframe = false;
-        for nal in nals {
+        for nal in frame.iter() {
             if [7, 8, 9].contains(&(nal[0] & 31)) {
                 continue;
             }
             keyframe |= nal[0] & 31 == 5;
-            data.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            data.extend_from_slice(&nal);
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
         }
-        if data.is_empty() {
+        if packet.len() == 128 {
             return Ok(());
         }
-        let mut header = video_header(data.len() + 16, 0, timestamp, clock.timeline)?;
+        let mut header = video_header(packet.len() - 128 + 16, 0, timestamp, clock.timeline)?;
         if keyframe {
             header[5] = 0x10;
         }
-        let packet = seal_video(&self.video_cipher, &header, self.video_nonce, &data)?;
+        packet[..128].copy_from_slice(&header);
+        seal_video(&self.video_cipher, self.video_nonce, packet)?;
         self.video_nonce = self
             .video_nonce
             .checked_add(1)
             .context("Video nonce exhausted")?;
-        self.write_video(&packet).await
+        Self::write_video(&mut self.video, packet).await
     }
 
     async fn send_audio(&mut self, time: Instant, pcm: &[u8]) -> Result<()> {
@@ -495,31 +500,26 @@ impl MirrorSession {
             self.audio_origin = Some((time, self.audio_rtp));
             self.send_sync(time, self.audio_rtp, true).await?;
         }
-        let payload = alac_verbatim(pcm)?;
         let mut header = [0u8; 12];
         header[0] = 0x80;
         header[1] = 96;
         header[2..4].copy_from_slice(&self.audio_seq.to_be_bytes());
         header[4..8].copy_from_slice(&self.audio_rtp.to_be_bytes());
         header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
-        let nonce = nonce(self.audio_nonce);
-        let sealed = self
-            .audio_cipher
-            .encrypt(
-                (&nonce).into(),
-                Payload {
-                    msg: &payload,
-                    aad: &header[4..12],
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("Audio encryption failed"))?;
-        let mut packet = header.to_vec();
-        packet.extend_from_slice(&sealed);
-        packet.extend_from_slice(&self.audio_nonce.to_le_bytes());
+        // Recycle the oldest retransmission buffer once the history is full.
+        let mut packet = if self.history.len() == 512 {
+            self.history.pop_front().unwrap().1
+        } else {
+            Vec::with_capacity(12 + 1416 + 16 + 8)
+        };
+        build_audio_packet(
+            &self.audio_cipher,
+            self.audio_nonce,
+            &header,
+            pcm,
+            &mut packet,
+        )?;
         self.audio.send(&packet).await?;
-        if self.history.len() == 512 {
-            self.history.pop_front();
-        }
         self.history.push_back((self.audio_seq, packet));
         self.audio_nonce = self
             .audio_nonce
@@ -553,10 +553,12 @@ impl MirrorSession {
         }
         let first = u16::from_be_bytes([request[4], request[5]]);
         let count = u16::from_be_bytes([request[6], request[7]]).min(512);
+        let mut response = Vec::new();
         for offset in 0..count {
             let seq = first.wrapping_add(offset);
-            if let Some((_, original)) = self.history.iter().find(|(number, _)| *number == seq) {
-                let mut response = vec![0x80, 0xd6, request[2], request[3]];
+            if let Some(original) = audio_history_packet(&self.history, seq) {
+                response.clear();
+                response.extend_from_slice(&[0x80, 0xd6, request[2], request[3]]);
                 response.extend_from_slice(original);
                 self.audio_control.send(&response).await?;
             } else {
@@ -614,25 +616,14 @@ fn video_header(length: usize, kind: u8, time: u64, timeline: u64) -> Result<[u8
     h[40..48].copy_from_slice(&timeline.to_le_bytes());
     Ok(h)
 }
-fn seal_video(
-    cipher: &ChaCha20Poly1305,
-    header: &[u8; 128],
-    counter: u64,
-    data: &[u8],
-) -> Result<Vec<u8>> {
-    let mut packet = header.to_vec();
-    packet.extend_from_slice(
-        &cipher
-            .encrypt(
-                (&nonce(counter)).into(),
-                Payload {
-                    msg: data,
-                    aad: header,
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("Video encryption failed"))?,
-    );
-    Ok(packet)
+fn seal_video(cipher: &ChaCha20Poly1305, counter: u64, packet: &mut Vec<u8>) -> Result<()> {
+    ensure!(packet.len() >= 128, "Missing video header");
+    let (header, data) = packet.split_at_mut(128);
+    let tag = cipher
+        .encrypt_in_place_detached((&nonce(counter)).into(), header, data)
+        .map_err(|_| anyhow::anyhow!("Video encryption failed"))?;
+    packet.extend_from_slice(&tag);
+    Ok(())
 }
 fn avcc_config(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
     ensure!(
@@ -648,28 +639,50 @@ fn avcc_config(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>> {
     Ok(config)
 }
 
-fn alac_verbatim(pcm: &[u8]) -> Result<Vec<u8>> {
+fn build_audio_packet(
+    cipher: &ChaCha20Poly1305,
+    counter: u64,
+    header: &[u8; 12],
+    pcm: &[u8],
+    packet: &mut Vec<u8>,
+) -> Result<()> {
+    packet.clear();
+    packet.extend_from_slice(header);
+    alac_verbatim(pcm, packet)?;
+    let tag = cipher
+        .encrypt_in_place_detached((&nonce(counter)).into(), &header[4..12], &mut packet[12..])
+        .map_err(|_| anyhow::anyhow!("Audio encryption failed"))?;
+    packet.extend_from_slice(&tag);
+    packet.extend_from_slice(&counter.to_le_bytes());
+    Ok(())
+}
+
+fn audio_history_packet(history: &VecDeque<(u16, Vec<u8>)>, sequence: u16) -> Option<&[u8]> {
+    // Packets are consecutive, including across the 16-bit RTP sequence wrap.
+    let offset = sequence.wrapping_sub(history.front()?.0) as usize;
+    let (stored_sequence, packet) = history.get(offset)?;
+    (*stored_sequence == sequence).then_some(packet)
+}
+
+fn alac_verbatim(pcm: &[u8], output: &mut Vec<u8>) -> Result<()> {
     ensure!(pcm.len() == 352 * 4, "Expected 352 stereo PCM frames");
-    let mut output = vec![0; (55 + pcm.len() * 8 + 3).div_ceil(8)];
-    let mut bit = 0;
-    let mut write = |value: u32, count: usize| {
-        for shift in (0..count).rev() {
-            output[bit / 8] |= (((value >> shift) & 1) as u8) << (7 - bit % 8);
-            bit += 1;
-        }
-    };
-    write(1, 3);
-    write(0, 4);
-    write(0, 12);
-    write(1, 1);
-    write(0, 2);
-    write(1, 1);
-    write(352, 32);
-    for sample in pcm.as_chunks::<2>().0 {
-        write(u16::from_le_bytes([sample[0], sample[1]]) as u32, 16);
+    let start = output.len();
+    output.resize(start + 1416, 0);
+    let frame = &mut output[start..];
+    // Stereo, explicit sample count, uncompressed 16-bit samples. The header
+    // occupies 55 bits, leaving one bit of byte 6 for the first sample.
+    frame[..7].copy_from_slice(&[0x20, 0, 0x12, 0, 0, 2, 0xc0]);
+    let mut cursor = 6;
+    for &[low, high] in pcm.as_chunks::<2>().0 {
+        frame[cursor] |= high >> 7;
+        frame[cursor + 1] = (high << 1) | (low >> 7);
+        frame[cursor + 2] = low << 1;
+        cursor += 2;
     }
-    write(7, 3);
-    Ok(output)
+    // Three-bit ALAC end tag, followed by zero padding to a byte boundary.
+    frame[cursor] |= 1;
+    frame[cursor + 1] = 0xc0;
+    Ok(())
 }
 
 async fn serve_events(
@@ -730,6 +743,25 @@ async fn serve_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chacha20poly1305::aead::{Aead, Payload};
+
+    fn encrypted_video(
+        cipher: &ChaCha20Poly1305,
+        header: &[u8; 128],
+        counter: u64,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(data);
+        seal_video(cipher, counter, &mut packet).unwrap();
+        packet
+    }
+
+    fn encoded_alac(pcm: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        alac_verbatim(pcm, &mut packet).unwrap();
+        packet
+    }
 
     #[test]
     #[ignore = "manual packet-encryption timing diagnostic"]
@@ -737,12 +769,35 @@ mod tests {
         let cipher = ChaCha20Poly1305::new(&[7; 32].into());
         let payload = vec![42; 65536];
         let header = video_header(payload.len() + 16, 0, 123, 456).unwrap();
+        let mut packet = Vec::with_capacity(128 + payload.len() + 16);
         let started = Instant::now();
-        for nonce in 0..100 {
-            std::hint::black_box(seal_video(&cipher, &header, nonce, &payload).unwrap());
+        for nonce in 0..10_000 {
+            packet.clear();
+            packet.extend_from_slice(&header);
+            packet.extend_from_slice(&payload);
+            seal_video(&cipher, nonce, &mut packet).unwrap();
+            std::hint::black_box(&packet);
         }
         eprintln!(
             "64 KiB video encryption: {:.3} ms/packet",
+            started.elapsed().as_secs_f64() / 10.0
+        );
+    }
+
+    #[test]
+    #[ignore = "manual audio packet timing diagnostic"]
+    fn measure_audio_packet_encoding() {
+        let cipher = ChaCha20Poly1305::new(&[7; 32].into());
+        let pcm = vec![42; 1408];
+        let header = [0; 12];
+        let mut packet = Vec::with_capacity(1452);
+        let started = Instant::now();
+        for counter in 0..100_000 {
+            build_audio_packet(&cipher, counter, &header, &pcm, &mut packet).unwrap();
+            std::hint::black_box(&packet);
+        }
+        eprintln!(
+            "352-sample audio encoding + encryption: {:.3} us/packet",
             started.elapsed().as_secs_f64() * 10.0
         );
     }
@@ -775,7 +830,7 @@ mod tests {
         );
         let cipher = ChaCha20Poly1305::new(&key.into());
         let header = video_header(19, 0, 123, 456).unwrap();
-        let packet = seal_video(&cipher, &header, 0, b"abc").unwrap();
+        let packet = encrypted_video(&cipher, &header, 0, b"abc");
         assert_eq!(packet.len(), 147);
         assert_eq!(
             cipher
@@ -802,14 +857,122 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_ne!(packet, seal_video(&cipher, &header, 1, b"abc").unwrap());
+        assert_ne!(packet, encrypted_video(&cipher, &header, 1, b"abc"));
     }
     #[test]
     fn uncompressed_alac_has_expected_bit_length_and_stereo_tag() {
-        let packet = alac_verbatim(&vec![0; 1408]).unwrap();
+        let packet = encoded_alac(&[0; 1408]);
         assert_eq!(packet.len(), 1416);
         assert_eq!(packet[0], 0x20);
-        assert!(alac_verbatim(&[0; 10]).is_err());
+        assert!(alac_verbatim(&[0; 10], &mut Vec::new()).is_err());
+    }
+
+    // Bit-at-a-time reference keeps the optimized byte packing honest at all
+    // 16-bit sample values, including signs and carries across byte boundaries.
+    fn reference_alac(pcm: &[u8]) -> Vec<u8> {
+        let mut output = vec![0; (55 + pcm.len() * 8 + 3).div_ceil(8)];
+        let mut bit = 0;
+        let mut write = |value: u32, count: usize| {
+            for shift in (0..count).rev() {
+                output[bit / 8] |= (((value >> shift) & 1) as u8) << (7 - bit % 8);
+                bit += 1;
+            }
+        };
+        for (value, count) in [(1, 3), (0, 4), (0, 12), (1, 1), (0, 2), (1, 1), (352, 32)] {
+            write(value, count);
+        }
+        for sample in pcm.as_chunks::<2>().0 {
+            write(u16::from_le_bytes(*sample) as u32, 16);
+        }
+        write(7, 3);
+        output
+    }
+
+    #[test]
+    fn alac_byte_packing_matches_reference_for_every_sample_value() {
+        for base in (0..=u16::MAX as usize).step_by(704) {
+            let pcm: Vec<u8> = (base..base + 704)
+                .flat_map(|sample| (sample as u16).to_le_bytes())
+                .collect();
+            assert_eq!(encoded_alac(&pcm), reference_alac(&pcm));
+        }
+    }
+
+    #[test]
+    fn reused_audio_packets_preserve_wire_format_and_authentication() {
+        let cipher = ChaCha20Poly1305::new(&[7; 32].into());
+        let header = [0x80, 96, 0xff, 0xff, 1, 2, 3, 4, 5, 6, 7, 8];
+        let mut packet = Vec::with_capacity(1452);
+        let original_allocation = packet.as_ptr();
+        for (counter, value) in [(0, 0xff), (1, 0), (u64::MAX - 1, 0x42)] {
+            let pcm = [value; 1408];
+            build_audio_packet(&cipher, counter, &header, &pcm, &mut packet).unwrap();
+            let payload = reference_alac(&pcm);
+            let ciphertext = cipher
+                .encrypt(
+                    (&nonce(counter)).into(),
+                    Payload {
+                        msg: &payload,
+                        aad: &header[4..12],
+                    },
+                )
+                .unwrap();
+            let mut expected = header.to_vec();
+            expected.extend_from_slice(&ciphertext);
+            expected.extend_from_slice(&counter.to_le_bytes());
+            assert_eq!(packet, expected);
+            assert_eq!(packet.as_ptr(), original_allocation);
+            assert_eq!(
+                cipher
+                    .decrypt(
+                        (&nonce(counter)).into(),
+                        Payload {
+                            msg: &packet[12..packet.len() - 8],
+                            aad: &header[4..12],
+                        }
+                    )
+                    .unwrap(),
+                payload
+            );
+            let mut tampered = header;
+            tampered[4] ^= 1;
+            assert!(
+                cipher
+                    .decrypt(
+                        (&nonce(counter)).into(),
+                        Payload {
+                            msg: &packet[12..packet.len() - 8],
+                            aad: &tampered[4..12],
+                        }
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn audio_history_lookup_handles_wrapped_and_evicted_sequences() {
+        let first = u16::MAX - 255;
+        let mut history: VecDeque<_> = (0..512)
+            .map(|offset| {
+                let sequence = first.wrapping_add(offset);
+                (sequence, sequence.to_be_bytes().to_vec())
+            })
+            .collect();
+        for offset in 0..512 {
+            let sequence = first.wrapping_add(offset);
+            assert_eq!(
+                audio_history_packet(&history, sequence),
+                Some(sequence.to_be_bytes().as_slice())
+            );
+        }
+        assert!(audio_history_packet(&history, first.wrapping_sub(1)).is_none());
+        assert!(audio_history_packet(&history, first.wrapping_add(512)).is_none());
+        history.pop_front();
+        assert!(audio_history_packet(&history, first).is_none());
+        assert!(audio_history_packet(&history, first.wrapping_add(1)).is_some());
+        history.clear();
+        assert!(audio_history_packet(&history, 0).is_none());
     }
     #[test]
     fn fixed_point_timestamps_preserve_half_seconds() {
@@ -835,7 +998,7 @@ mod tests {
             .map(|i| (i as i16).wrapping_mul(173).wrapping_sub(32768u16 as i16))
             .collect();
         let pcm: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let encoded = alac_verbatim(&pcm).unwrap();
+        let encoded = encoded_alac(&pcm);
         let mut cookie = vec![];
         cookie.extend_from_slice(&352u32.to_be_bytes());
         cookie.extend_from_slice(&[0, 16, 40, 10, 14, 2]);

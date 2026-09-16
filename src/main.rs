@@ -1,13 +1,14 @@
 use airplay_core::Device;
 use gpui::{
-    App, Application, Bounds, Context, FocusHandle, KeyDownEvent, SharedString, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, Application, Bounds, Context, FocusHandle, KeyDownEvent,
+    PathBuilder, SharedString, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*,
+    px, rgb, size,
 };
 use spielab::{
     backend::{Backend, Command, Event},
     settings::{CaptureMode, LatencyMode, VideoQuality},
 };
-use std::path::PathBuf;
+use std::{f32::consts::TAU, path::PathBuf, time::Duration};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -74,6 +75,7 @@ struct Spielab {
     pin_required: bool,
     pin: String,
     busy: bool,
+    discovering: bool,
     authenticated: bool,
     streaming: bool,
     screen: Option<String>,
@@ -120,6 +122,7 @@ impl Spielab {
             pin_required: false,
             pin: String::new(),
             busy: true,
+            discovering: true,
             authenticated: false,
             streaming: false,
             screen: None,
@@ -144,6 +147,9 @@ impl Spielab {
         }
         self.busy = false;
         self.error = false;
+        if !matches!(event, Event::Busy(_)) {
+            self.discovering = false;
+        }
         match event {
             Event::Devices(devices) => {
                 self.status = if devices.is_empty() {
@@ -206,6 +212,7 @@ impl Spielab {
         self.receiver = None;
         self.authenticated = false;
         self.streaming = false;
+        self.discovering = false;
         self.pin_required = false;
         self.pin.clear();
         self.screen = None;
@@ -215,15 +222,39 @@ impl Spielab {
     }
 
     fn send(&mut self, command: Command, cx: &mut Context<Self>) {
+        let discovering = matches!(command, Command::Discover);
         match self.backend.send(command) {
             Ok(()) => {
                 self.busy = true;
+                self.discovering = discovering;
                 self.error = false;
+                if discovering {
+                    self.status = "Looking for AirPlay receivers…".into();
+                }
             }
             Err(error) => {
+                self.discovering = false;
                 self.status = error.to_string();
                 self.error = true;
             }
+        }
+        cx.notify();
+    }
+
+    fn toggle_dark_mode(&mut self, cx: &mut Context<Self>) {
+        self.dark_mode = !self.dark_mode;
+        let preferences = Preferences {
+            dark_mode: self.dark_mode,
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let temporary = self.preferences_path.with_extension("tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&preferences)?)?;
+            std::fs::rename(temporary, &self.preferences_path)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.status = format!("Could not save appearance: {error}");
+            self.error = true;
         }
         cx.notify();
     }
@@ -298,6 +329,48 @@ fn card(theme: Theme, title: &str, description: &str) -> gpui::Div {
                 .text_color(rgb(theme.muted))
                 .child(description.to_owned()),
         )
+}
+
+fn discovery_spinner(theme: Theme) -> impl IntoElement {
+    // GPUI schedules frames only while this element is mounted during discovery.
+    div().size(px(18.)).flex_shrink_0().with_animation(
+        "discovery-spinner",
+        Animation::new(Duration::from_millis(900)).repeat(),
+        move |element, progress| {
+            element.child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let center = bounds.center();
+                        let radius = bounds.size.width / 2. - px(2.);
+                        let at = |angle: f32| {
+                            point(
+                                center.x + radius * angle.cos(),
+                                center.y + radius * angle.sin(),
+                            )
+                        };
+                        let radii = point(radius, radius);
+                        let mut track = PathBuilder::stroke(px(2.));
+                        track.move_to(at(0.));
+                        track.arc_to(radii, px(0.), false, true, at(TAU / 2.));
+                        track.arc_to(radii, px(0.), false, true, at(0.));
+                        track.close();
+                        if let Ok(path) = track.build() {
+                            window.paint_path(path, rgb(theme.border));
+                        }
+                        let start = progress * TAU;
+                        let mut arc = PathBuilder::stroke(px(2.));
+                        arc.move_to(at(start));
+                        arc.arc_to(radii, px(0.), true, true, at(start + TAU * 0.75));
+                        if let Ok(path) = arc.build() {
+                            window.paint_path(path, rgb(theme.accent));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        },
+    )
 }
 
 impl Spielab {
@@ -383,13 +456,19 @@ impl Spielab {
             button(
                 theme,
                 "refresh",
-                if self.busy {
+                if self.discovering {
                     "Looking for TVs…"
                 } else {
                     "Refresh devices"
                 },
                 idle,
             )
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(self.discovering, |button| {
+                button.opacity(1.).child(discovery_spinner(theme))
+            })
             .on_click(cx.listener(|view, _, _, cx| {
                 if !view.busy {
                     view.send(Command::Discover, cx);
@@ -580,34 +659,49 @@ impl Spielab {
                     ),
                 )
                 .child(
-                    button(
-                        theme,
-                        "dark-mode",
-                        if self.dark_mode {
-                            "●  On"
+                    div()
+                        .id("dark-mode")
+                        .focusable()
+                        .cursor_pointer()
+                        .flex_shrink_0()
+                        .w(px(52.))
+                        .h(px(30.))
+                        .p(px(2.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(rgb(if self.dark_mode {
+                            theme.accent
                         } else {
-                            "○  Off"
-                        },
-                        true,
-                    )
-                    .border_color(rgb(theme.accent))
-                    .on_click(cx.listener(|view, _, _, cx| {
-                        view.dark_mode = !view.dark_mode;
-                        let preferences = Preferences {
-                            dark_mode: view.dark_mode,
-                        };
-                        let result = (|| -> anyhow::Result<()> {
-                            let temporary = view.preferences_path.with_extension("tmp");
-                            std::fs::write(&temporary, serde_json::to_vec(&preferences)?)?;
-                            std::fs::rename(temporary, &view.preferences_path)?;
-                            Ok(())
-                        })();
-                        if let Err(error) = result {
-                            view.status = format!("Could not save appearance: {error}");
-                            view.error = true;
-                        }
-                        cx.notify();
-                    })),
+                            theme.border
+                        }))
+                        .bg(rgb(if self.dark_mode {
+                            theme.accent
+                        } else {
+                            theme.button
+                        }))
+                        .focus(move |style| style.border_color(rgb(theme.text)))
+                        .hover(|style| style.opacity(0.85))
+                        .flex()
+                        .items_center()
+                        .when(self.dark_mode, |switch| switch.justify_end())
+                        .child(
+                            div()
+                                .size(px(22.))
+                                .rounded_full()
+                                .bg(rgb(if self.dark_mode {
+                                    theme.background
+                                } else {
+                                    theme.panel
+                                }))
+                                .shadow_sm(),
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| view.toggle_dark_mode(cx)))
+                        .on_key_down(cx.listener(|view, event: &KeyDownEvent, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "space" | "enter") {
+                                view.toggle_dark_mode(cx);
+                                cx.stop_propagation();
+                            }
+                        })),
                 ),
         )
     }
@@ -663,17 +757,25 @@ impl Render for Spielab {
             .child(
                 div()
                     .flex()
+                    .flex_shrink_0()
                     .justify_between()
                     .items_center()
                     .gap_4()
                     .child(
-                        div().child(div().text_3xl().child("Spielab")).child(
-                            div().text_sm().text_color(rgb(theme.muted)).child(
-                                self.receiver
-                                    .clone()
-                                    .unwrap_or("Your desktop, on Apple TV".into()),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_3xl().child("Spielab"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(if self.error {
+                                        theme.danger
+                                    } else {
+                                        theme.muted
+                                    }))
+                                    .child(self.status.clone()),
                             ),
-                        ),
                     )
                     .child(
                         button(
@@ -686,6 +788,7 @@ impl Render for Spielab {
                             },
                             can_stop,
                         )
+                        .flex_shrink_0()
                         .bg(rgb(theme.danger))
                         .text_color(rgb(0xffffff))
                         .border_color(rgb(theme.danger))
@@ -718,20 +821,6 @@ impl Render for Spielab {
                             .overflow_y_scroll()
                             .child(content),
                     ),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(if self.error {
-                        theme.danger
-                    } else {
-                        theme.border
-                    }))
-                    .bg(rgb(theme.panel))
-                    .text_sm()
-                    .child(self.status.clone()),
             )
     }
 }

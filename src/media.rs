@@ -3,11 +3,12 @@ use crate::capture::ScreenCapture;
 use crate::settings::{VideoConfig, VideoQuality};
 use anyhow::{Context, Result, ensure};
 use std::{
+    ops::Range,
     os::{fd::AsRawFd, unix::process::CommandExt},
     process::Stdio,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::{Child, ChildStdout, Command},
 };
 
@@ -30,7 +31,7 @@ impl VideoEncoder {
         let mut capture = VideoCapture::start_with_encoder(None, config, self)?;
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             for index in 0..3 {
-                let frame = capture.frame().await?;
+                let frame = capture.frame_packet().await?;
                 ensure!(
                     frame.iter().any(|n| matches!(n[0] & 31, 1 | 5)),
                     "Encoder returned no picture"
@@ -99,9 +100,61 @@ pub struct VideoCapture {
     encoder: Child,
     source: Option<std::process::Child>,
     output: ChildStdout,
-    packet_sizes: Lines<BufReader<tokio::net::UnixStream>>,
+    packet_sizes: BufReader<tokio::net::UnixStream>,
+    packet_metadata: String,
     pub width: u32,
     pub height: u32,
+}
+
+/// Keep the encoder packet intact while exposing its NAL units without copying.
+pub(crate) struct VideoFrame {
+    packet: Vec<u8>,
+    nals: Vec<Range<usize>>,
+}
+
+impl VideoFrame {
+    fn from_packet(packet: Vec<u8>) -> Result<Self> {
+        let mut cursor = start_code(&packet, 0).context("Encoder returned non-Annex-B video")?;
+        ensure!(cursor.0 == 0, "Unexpected data before H.264 start code");
+        let mut nals = Vec::new();
+        loop {
+            let begin = cursor.0 + cursor.1;
+            let next = start_code(&packet, begin);
+            let end = next.map_or(packet.len(), |(offset, _)| offset);
+            ensure!(end > begin, "Empty H.264 NAL unit");
+            if packet[begin] & 31 != 9 {
+                nals.push(begin..end);
+            }
+            match next {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        ensure!(!nals.is_empty(), "Encoded packet has no video NAL units");
+        Ok(Self { packet, nals })
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.nals.iter().map(|range| &self.packet[range.clone()])
+    }
+}
+
+fn screen_video_filters(config: VideoConfig) -> [String; 8] {
+    // Discard surplus compositor refreshes before touching their pixels. Doing
+    // conversion and scaling together also avoids a full-size intermediate frame.
+    [
+        "videorate".into(),
+        "!".into(),
+        format!("video/x-raw,framerate={}/1", config.fps),
+        "!".into(),
+        "videoconvertscale".into(),
+        "add-borders=true".into(),
+        "!".into(),
+        format!(
+            "video/x-raw,format=I420,width={},height={},framerate={}/1",
+            config.width, config.height, config.fps
+        ),
+    ]
 }
 
 impl VideoCapture {
@@ -143,8 +196,7 @@ impl VideoCapture {
         command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
         let (metadata_reader, metadata_writer) = std::os::unix::net::UnixStream::pair()?;
         metadata_reader.set_nonblocking(true)?;
-        let packet_sizes =
-            BufReader::new(tokio::net::UnixStream::from_std(metadata_reader)?).lines();
+        let packet_sizes = BufReader::new(tokio::net::UnixStream::from_std(metadata_reader)?);
         let metadata_fd = metadata_writer.as_raw_fd();
         unsafe {
             command.pre_exec(move || {
@@ -176,21 +228,9 @@ impl VideoCapture {
                 "max-size-time=0",
                 "leaky=downstream",
                 "!",
-                "videoconvert",
-                "!",
-                "videoscale",
-                "add-borders=true",
-                "!",
-                "videorate",
-                "!",
-                &format!("video/x-raw,format=I420,width={width},height={height},framerate={fps}/1"),
-                "!",
-                "y4menc",
-                "!",
-                "fdsink",
-                "fd=1",
-                "sync=false",
             ])
+            .args(screen_video_filters(config))
+            .args(["!", "y4menc", "!", "fdsink", "fd=1", "sync=false"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -308,6 +348,7 @@ impl VideoCapture {
             source,
             output,
             packet_sizes,
+            packet_metadata: String::with_capacity(128),
             width,
             height,
         })
@@ -317,13 +358,26 @@ impl VideoCapture {
     /// encoded packet. This preserves frame boundaries without waiting for the
     /// next frame's AUD, including when the desktop stops changing.
     pub async fn frame(&mut self) -> Result<Vec<Vec<u8>>> {
+        Ok(self
+            .frame_packet()
+            .await?
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect())
+    }
+
+    pub(crate) async fn frame_packet(&mut self) -> Result<VideoFrame> {
         loop {
-            let line = self
+            self.packet_metadata.clear();
+            let read = self
                 .packet_sizes
-                .next_line()
-                .await?
-                .context("Video encoder stopped before providing the next packet")?;
-            let Some(size) = packet_size(&line)? else {
+                .read_line(&mut self.packet_metadata)
+                .await?;
+            ensure!(
+                read != 0,
+                "Video encoder stopped before providing the next packet"
+            );
+            let Some(size) = packet_size(&self.packet_metadata)? else {
                 continue;
             };
             let mut packet = vec![0; size];
@@ -331,7 +385,7 @@ impl VideoCapture {
                 .read_exact(&mut packet)
                 .await
                 .context("Truncated encoded video packet")?;
-            return split_packet(&packet);
+            return VideoFrame::from_packet(packet);
         }
     }
 }
@@ -340,38 +394,22 @@ fn packet_size(line: &str) -> Result<Option<usize>> {
     if line.starts_with('#') || line.trim().is_empty() {
         return Ok(None);
     }
-    let fields: Vec<_> = line.split(',').map(str::trim).collect();
+    let mut fields = line.split(',').map(str::trim);
     ensure!(
-        fields.len() >= 6 && fields[0] == "0",
+        fields.next() == Some("0"),
         "Invalid encoder packet metadata"
     );
-    let size: usize = fields[4].parse().context("Invalid encoded packet size")?;
+    let size: usize = fields
+        .nth(3)
+        .context("Invalid encoder packet metadata")?
+        .parse()
+        .context("Invalid encoded packet size")?;
+    ensure!(fields.next().is_some(), "Invalid encoder packet metadata");
     ensure!(
         (1..=16 * 1024 * 1024).contains(&size),
         "Encoded packet exceeds size limit"
     );
     Ok(Some(size))
-}
-
-fn split_packet(packet: &[u8]) -> Result<Vec<Vec<u8>>> {
-    let mut cursor = start_code(packet, 0).context("Encoder returned non-Annex-B video")?;
-    ensure!(cursor.0 == 0, "Unexpected data before H.264 start code");
-    let mut nals = Vec::new();
-    loop {
-        let begin = cursor.0 + cursor.1;
-        let next = start_code(packet, begin);
-        let end = next.map_or(packet.len(), |(offset, _)| offset);
-        ensure!(end > begin, "Empty H.264 NAL unit");
-        if packet[begin] & 31 != 9 {
-            nals.push(packet[begin..end].to_vec());
-        }
-        match next {
-            Some(next) => cursor = next,
-            None => break,
-        }
-    }
-    ensure!(!nals.is_empty(), "Encoded packet has no video NAL units");
-    Ok(nals)
 }
 
 fn start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
@@ -457,9 +495,125 @@ mod tests {
             "0,0,0,1,16777217,0x0",
             "0,0,0,1,-1,0x0",
             "1,0,0,1,4,0x0",
+            "0,0,0,1,42",
             "broken",
         ] {
             assert!(packet_size(line).is_err());
+        }
+    }
+
+    #[test]
+    fn video_frame_borrows_nals_from_the_original_packet_and_skips_aud() {
+        let packet = vec![
+            0, 0, 0, 1, 0x09, 0xf0, 0, 0, 1, 0x67, 5, 0, 0, 0, 1, 0x68, 8, 0, 0, 1, 0x65, 0, 0, 3,
+            1, 42,
+        ];
+        let original = packet.as_ptr();
+        let frame = VideoFrame::from_packet(packet).unwrap();
+        assert_eq!(frame.packet.as_ptr(), original);
+        assert_eq!(
+            frame.iter().collect::<Vec<_>>(),
+            vec![&[0x67, 5][..], &[0x68, 8][..], &[0x65, 0, 0, 3, 1, 42][..]]
+        );
+        assert_eq!(
+            frame.iter().next().unwrap().as_ptr(),
+            frame.packet[9..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn video_frame_rejects_missing_start_codes_and_empty_nals() {
+        for packet in [
+            vec![],
+            vec![0x65, 1, 2],
+            vec![1, 0, 0, 1, 0x65],
+            vec![0, 0, 1],
+            vec![0, 0, 1, 0, 0, 1, 0x65],
+            vec![0, 0, 1, 0x09, 0xf0],
+            vec![0, 0, 1, 0x65, 0, 0, 1],
+        ] {
+            assert!(VideoFrame::from_packet(packet).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GStreamer with videoconvertscale, videorate and y4menc"]
+    fn screen_preprocessing_preserves_format_cadence_and_aspect_ratio() {
+        // Compare actual output against the previous transform sequence. Include
+        // both frame dropping and duplication, and a non-widescreen source.
+        for (input_fps, output_fps) in [(60, 30), (30, 60), (60, 60)] {
+            let config = VideoConfig {
+                width: 96,
+                height: 54,
+                fps: output_fps,
+                ..VideoQuality::Efficient.config()
+            };
+            let run = |filters: &[String]| {
+                let output = std::process::Command::new("gst-launch-1.0")
+                    .args([
+                        "-q",
+                        "videotestsrc",
+                        &format!("num-buffers={input_fps}"),
+                        "pattern=white",
+                        "!",
+                        &format!(
+                            "video/x-raw,format=BGRx,width=64,height=48,framerate={input_fps}/1"
+                        ),
+                        "!",
+                    ])
+                    .args(filters)
+                    .args(["!", "y4menc", "!", "fdsink", "fd=1", "sync=false"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                output.stdout
+            };
+            let filters = screen_video_filters(config);
+            let actual = run(&filters);
+            let previous = run(&[
+                "videoconvert".into(),
+                "!".into(),
+                "videoscale".into(),
+                "add-borders=true".into(),
+                "!".into(),
+                "videorate".into(),
+                "!".into(),
+                filters.last().unwrap().clone(),
+            ]);
+            assert_eq!(
+                actual, previous,
+                "Output changed for {input_fps} -> {output_fps} fps"
+            );
+            let header_end = actual.iter().position(|&byte| byte == b'\n').unwrap();
+            let header = std::str::from_utf8(&actual[..header_end]).unwrap();
+            for field in [
+                "C420jpeg",
+                "W96",
+                "H54",
+                "A3:4",
+                &format!("F{output_fps}:1"),
+            ] {
+                assert!(
+                    header.split_whitespace().any(|value| value == field),
+                    "{header}"
+                );
+            }
+            let frames = &actual[header_end + 1..];
+            let frame_size = 6 + 96 * 54 * 3 / 2;
+            assert_eq!(frames.len() % frame_size, 0);
+            assert!(
+                (output_fps as usize..=output_fps as usize + 1)
+                    .contains(&(frames.len() / frame_size))
+            );
+            assert!(
+                frames
+                    .chunks_exact(frame_size)
+                    .all(|frame| frame.starts_with(b"FRAME\n"))
+            );
         }
     }
 

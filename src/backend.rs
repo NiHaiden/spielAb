@@ -200,7 +200,12 @@ impl Worker {
                 let events = self.events.clone();
                 mirror
                     .run(session, video, audio, move |frames| {
-                        let _ = events.try_send(Event::Streaming(frames));
+                        // The UI only displays the transition to sharing. Sending
+                        // every progress tick needlessly wakes and redraws it,
+                        // and queues stale events while the UI is unavailable.
+                        if frames == 1 {
+                            let _ = events.try_send(Event::Streaming(frames));
+                        }
                     })
                     .await?;
             }
