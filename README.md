@@ -53,3 +53,6 @@ CLI examples for discovery, pairing, and mirroring are in [`examples/`](examples
 ## License and acknowledgments
 
 [GPL-2.0-only](LICENSE). Built using [airplay2-rs](https://github.com/lmcgartland/airplay2-rs), with protocol references from [Doubletake](https://github.com/omarroth/doubletake) and [UxPlay](https://github.com/FDH2/UxPlay).
+
+
+# Super rusty.
